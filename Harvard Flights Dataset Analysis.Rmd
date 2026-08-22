@@ -1,0 +1,482 @@
+---
+title: "ST2195_Coursework_Part2a"
+author: "Frederick William Wantigo"
+date: "2025-03-20"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Install essential packages
+```{r}
+install.packages("pROC")
+install.packages("AUC")
+install.packages("RSQLite")
+install.packages("biglm")
+install.packages("ROSE")
+install.packages("gplots")
+install.packages("ROCit")
+```
+
+### load essential packages
+
+```{r}
+library(gplots)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(ggpubr)
+library(scales)
+library(caret)
+library(ROCit)
+library(reshape2)
+library(AUC)
+library(DBI)
+library(RSQLite)
+library(gridExtra)
+library(biglm)
+library(glmnet)
+library(ROSE)
+```
+
+## load yearly basis data
+
+```{r}
+conn <- dbConnect(RSQLite::SQLite(), "flights_data.db")
+
+for (i in 2001:2005){
+  flights_data <- read.csv(paste0("C:/Users/fwant/FREDDY/SINGAPORE FREDDY/COURSES/YEAR 2/PROGRAMMING FOR DATA SCIENCE/ST2195_Coursework/Part 2/flights_data/",i,".csv.bz2"), header=TRUE)
+  if (i == 2001){
+      dbWriteTable(conn,"flights_data", flights_data, overwrite = TRUE)
+  }
+  else {
+    dbWriteTable(conn,"flights_data", flights_data, append = TRUE, row.names = FALSE)
+  }
+} # This will load every year's excel sheet and will combine them into 1 data frame using dbWriteTable
+
+airports <- read.csv("C:/Users/fwant/FREDDY/SINGAPORE FREDDY/COURSES/YEAR 2/PROGRAMMING FOR DATA SCIENCE/ST2195_Coursework/Part 2/flights_data/airports.csv", header = TRUE)
+carriers <- read.csv("C:/Users/fwant/FREDDY/SINGAPORE FREDDY/COURSES/YEAR 2/PROGRAMMING FOR DATA SCIENCE/ST2195_Coursework/Part 2/flights_data/carriers.csv", header = TRUE)
+planes <- read.csv("C:/Users/fwant/FREDDY/SINGAPORE FREDDY/COURSES/YEAR 2/PROGRAMMING FOR DATA SCIENCE/ST2195_Coursework/Part 2/flights_data/plane-data.csv", header = TRUE)
+dbWriteTable(conn,"airports", airports, overwrite = TRUE)
+dbWriteTable(conn,"carriers", carriers, overwrite = TRUE)
+dbWriteTable(conn,"planes", planes, overwrite = TRUE)
+```
+
+## add supporting files as well as information about the flights
+```{r}
+#read supporting files
+variable_descriptions <- read.csv("C:/Users/fwant/FREDDY/SINGAPORE FREDDY/COURSES/YEAR 2/PROGRAMMING FOR DATA SCIENCE/ST2195_Coursework/Part 2/flights_data/variable-descriptions.csv", header = TRUE)
+
+#Additional information about the flights
+head(airports)
+carriers
+planes
+(variable_descriptions)
+```
+
+## remove cancelled and diverted flights as well as filtering the first 100 results
+```{r}
+#removing cancelled and diverted flights:
+flights <- dbGetQuery(conn, "SELECT * 
+                            FROM flights_data 
+                            WHERE Cancelled = 0 AND Diverted = 0") # Select the flights that are not cancelled nor diverted
+dbWriteTable(conn,"flights", flights, overwrite = TRUE)
+
+#Filter the first 100 results
+dbGetQuery(conn, "SELECT * FROM flights LIMIT 100")
+```
+
+## change DayOfWeek to day name corresponding to the numbers
+```{r}
+#Change DayOfWeek to their corresponding day
+dbExecute(conn, "
+          UPDATE flights
+          SET DayOfWeek = (
+          CASE 
+            WHEN DayOfWeek = 1 THEN 'Monday'
+            WHEN DayOfWeek = 2 THEN 'Tuesday' 
+            WHEN DayOfWeek = 3 THEN 'Wednesday'
+            WHEN DayOfWeek = 4 THEN 'Thursday'
+            WHEN DayOfWeek = 5 THEN 'Friday'
+            WHEN DayOfWeek = 6 THEN 'Saturday'
+            WHEN DayOfWeek = 7 THEN 'Sunday'
+          END
+          );"
+) #Change the number in DaysOfWeek column to their corresponding day; e.g. 1 = Monday, 2 = Tuesday, etc.
+
+#create another column which shows the total delays
+dbExecute(conn, "ALTER TABLE flights ADD COLUMN TotalDelay INTEGER")
+dbExecute(conn, "UPDATE flights SET TotalDelay = DepDelay + ArrDelay WHERE DepDelay IS NOT NULL AND ArrDelay IS NOT NULL")
+#TotalDelay = DepartureDelay + ArrivalDelay
+```
+
+### 2a) What are the best times and days of the week to minimise delays each year?
+```{r}
+#search by per quarter of a day
+dbExecute(conn, "
+          CREATE TABLE IF NOT EXISTS Daily (
+          Year INTEGER,
+          DayOfWeek TEXT,
+          SDepPartOfDay TEXT,
+          TotalDelays INTEGER,
+          AverageDelay INTEGER,
+          DepDelay INTEGER,
+          ArrDelay INTEGER)")
+
+#Insert datas from 'flights' table to 'Daily' table
+dbExecute(conn, "
+          INSERT INTO Daily(Year, DayOfWeek, SDepPartOfDay, TotalDelays, DepDelay, ArrDelay)
+          SELECT Year, DayOfWeek, CRSDepTime, TotalDelay, DepDelay, ArrDelay
+          FROM flights")
+
+#Categorise the time of the day such as 'Dawn', 'Morning', 'Evening', and 'Night'
+dbExecute(conn,"
+          UPDATE Daily
+          SET SDepPartOfDay = (
+          SELECT CASE
+            WHEN CAST(SDepPartOfDay AS INTEGER) BETWEEN 0 AND 600 THEN 'Dawn'
+            WHEN CAST(SDepPartOfDay AS INTEGER) BETWEEN 601 AND 1200 THEN 'Morning'
+            WHEN CAST(SDepPartOfDay AS INTEGER) BETWEEN 1201 AND 1800 THEN 'Evening'
+            WHEN CAST(SDepPartOfDay AS INTEGER) BETWEEN 1801 AND 2400 THEN 'Night'
+          END
+          );"
+) #with assumption that some datas in CRSDeparture Time have 0 as 'Dawn' and 2400 as 'Night'
+
+#Calculate the total delay and average delay
+dbExecute(conn, "CREATE INDEX IF NOT EXISTS idx_daily_grouping2 ON Daily (Year, DayOfWeek, SDepPartOfDay);")
+
+dbExecute(conn, "
+  CREATE TABLE IF NOT EXISTS DelaySummary AS
+  SELECT Year, DayOfWeek, SDepPartOfDay, 
+         COUNT(TotalDelays) AS CountOfFlights,
+         SUM(TotalDelays) AS TotalDelay, 
+         ROUND(AVG(DepDelay),3) AS AverageDepDelay,
+         ROUND(AVG(ArrDelay),3) AS AverageArrDelay,
+         ROUND(AVG(TotalDelays),3) AS AverageDelay
+  FROM Daily
+  GROUP BY Year, DayOfWeek, SDepPartOfDay;
+")
+
+dbExecute(conn, "
+  UPDATE DelaySummary
+  SET TotalDelay = (
+    SELECT SUM(TotalDelays) 
+    FROM Daily 
+    WHERE Daily.Year = DelaySummary.Year
+      AND Daily.DayOfWeek = DelaySummary.DayOfWeek
+      AND Daily.SDepPartOfDay = DelaySummary.SDepPartOfDay
+  )
+  WHERE EXISTS (
+    SELECT 1 FROM Daily 
+    WHERE Daily.Year = DelaySummary.Year 
+      AND Daily.DayOfWeek = DelaySummary.DayOfWeek
+      AND Daily.SDepPartOfDay = DelaySummary.SDepPartOfDay
+  );
+") # All total delays are being added according to their indexes and only show one unique index per combination
+
+#Convert DelaySummary into an R based dataframe
+#Turning an SQL table into an R table
+Delay_summ <- dbGetQuery(conn,"SELECT * FROM DelaySummary")
+
+#Sort columns based on Year, DayOfWeek, and Scheduled Departure Part Of Day
+Delay_summ_sorted <- Delay_summ %>%
+  mutate(
+    DayOfWeek = factor(DayOfWeek,levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")),
+    SDepPartOfDay = factor(SDepPartOfDay,levels = c("Dawn", "Morning", "Evening", "Night"))
+  ) %>%
+  arrange(Year, DayOfWeek, SDepPartOfDay)
+print(Delay_summ_sorted)
+
+#convert Delay_summ_sorted to a long table format as faceted heatmap can only contain one x, one y, and one fill variables 
+Delay_summ_sorted_long <- select(Delay_summ_sorted, Year, DayOfWeek, SDepPartOfDay, AverageDelay) %>%
+  pivot_longer(
+    cols = AverageDelay,  
+    names_to = "AverageDelay",   
+    values_to = "Value"   
+  )
+print(Delay_summ_sorted_long)
+
+#visualisation
+#create faceted heatmap for average delay
+average_delay_plot <- ggplot(Delay_summ_sorted_long, aes(x = SDepPartOfDay, y = DayOfWeek, fill = Value)) +
+  geom_tile(color = "black", linewidth=0.25) +
+  geom_text(aes(label = round(Value, 2)), size = 2.6, position = position_identity(), alpha = 0.7)+
+  scale_fill_gradient2(low = "green", mid = "yellow", high = "red", midpoint = median(Delay_summ_sorted_long$Value)) +
+  facet_wrap(~ Year) +  
+  labs(title = "Average Delay Heatmap",
+       x = "Parts of the day", 
+       y = "Day name",
+       fill = "Delay (In minutes)") +
+  theme(
+    strip.text = element_text(size = 10),  # Increase Facet title size
+    axis.text.x = element_text(size = 8), # Increase axis labels
+    panel.spacing = unit(0.5, "lines")  # Reduce space between facets
+  ) 
+print(average_delay_plot)
+```
+
+## Summary
+The result will be the average delay heatmap with parts of the day ("Dawn", "Morning", "Evening", and "Night") as the x axis and the day name ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", and "Sunday") as the y axis. There will be numbers that indicate the average delay in minutes. Green coloured indicates the small number in average delay minutes and red coloured indicates the big number in average delay minutes. There are cases where the number is negative, meaning that it is not a delay, but rather an early. According to the heatmap provided, it is shown that most flights have higher chance of getting delayed in the night. This might be due to environment circumstances where there would be more preparation from the aviation team. Another assumption would be that more flights are conducted in the night so that the passengers will arrive at their destination in the morning or evening. If we filter down by each day, it can be sought that Wednesday dawn time has the lowest average delay. 
+
+### Conclusion
+Therefore, the best times and days of the week to minimise flight delays each year is on Wednesday around morning time with an average of -3.6 minutes according to the average delay heatmap plot. A few possible reasons might be due to dawn time where the air traffic tends to be "quieter" than other parts of the day and the fact that Wednesday is in the middle of the week, meaning that it is the furthest day away from the weekends. 
+
+### 2b. Do Older Planes Suffer More Delays on A Year-to-Year Basis?
+
+## Remove invalid years and convert year to numeric as well as renaming "Tailnum" column in flights data to "tailnum" because R is case sensitive
+```{r}
+planes$year <- as.numeric(planes$year) # Convert year to numeric
+planes <- filter(planes, !is.na(year) & year > 1900) # Remove invalid years
+
+#rename Tailnum to tailnum in flights
+colnames(flights)[colnames(flights) == "TailNum"] <- "tailnum"
+```
+
+## Merge the flights data with the planes data by tailnum and calculate the age of the aircraft as well as removing invalid ages
+```{r}
+#merge flights with planes data
+flights_planes <- flights %>%
+  inner_join(planes, by = "tailnum") %>%  #merge on tailnum
+  mutate(AircraftAge = Year - year) %>%   #calculate Aircraft Age
+  filter(AircraftAge >= 0)                #remove invalid ages
+```
+
+## Compute the average delay by aircraft age
+```{r}
+#compute average delay by aircraft age
+delay_by_age <- flights_planes %>%
+  group_by(AircraftAge) %>%
+  summarise(AverageDepDelay = mean(DepDelay, na.rm = TRUE),
+            AverageArrDelay = mean(ArrDelay, na.rm = TRUE))
+```
+
+## First visualisation with years combined (line graph)
+```{r}
+#visualisation
+ggplot(delay_by_age, aes(x = AircraftAge)) +
+  geom_line(aes(y = AverageDepDelay, color = "Departure Delay"), size = 0.7) +
+  geom_line(aes(y = AverageArrDelay, color = "Arrival Delay"), size = 0.7) +
+  labs(title = "Do Older Planes Suffer More Delays?",
+       x = "Aircraft Age (Years)",
+       y = "Average Delay (Minutes)") +
+  theme_minimal() +
+  scale_color_manual(name = "Delay Type", values = c("green", "violet"))
+```
+
+### Necessary steps for second visualisation
+## Group both Aircraftage and Year, then summarise delays
+```{r}
+delay_by_age_year <- flights_planes %>%
+  group_by(Year, AircraftAge) %>%
+  summarise(AverageDepDelay = mean(DepDelay, na.rm = TRUE),
+            AverageArrDelay = mean(ArrDelay, na.rm = TRUE)) %>%
+  ungroup()
+```
+
+## For better visualisation, we convert Year to a factor
+```{r}
+delay_by_age_year$Year <- as.factor(delay_by_age_year$Year)
+```
+
+## Second visualisation with each year separated (scatter plot)
+```{r}
+# Create scatter plot with faceting by Year
+ggplot(delay_by_age_year, aes(x = AircraftAge)) +
+  geom_point(aes(y = AverageDepDelay, color = "Departure Delay"), alpha = 0.6, size = 1) +
+  geom_point(aes(y = AverageArrDelay, color = "Arrival Delay"), alpha = 0.6, size = 1) +
+  labs(title = "Do Older Planes Suffer More Delays? (Yearly Breakdown)",
+       x = "Aircraft Age (Years)",
+       y = "Average Delay (Minutes)") +
+  theme_minimal() +
+  scale_color_manual(name = "Delay Type", values = c("green", "violet")) +
+  facet_wrap(~Year, ncol = 2)  #Facet by year for separated scatter plots
+```
+
+## Summary
+The result of this code would be in 2 types of graphs, which are line graph and scatter plots. The line graph will explain about how older planes got more delays, but with combined years. Meanwhile, there will be five scatter plots, where each scatter plot represents the average delay trend by planes in terms of aircraft age in each year. The average delay which is measured in minutes with the interval of 2.5 minutes for indicator purposes is in the Y-axis while the aircraft age measured in years with the interval of 10 years for indicator purposes is in the X-axis. The colours green and violet represents the delay type, which are arrival delay and departure delay respectively. 
+
+The first plot (line graph) shows that the overall hypothesised statement where older planes suffer more delays is somewhat true. This can be seen by the characteristics of the line, where both green and violet lines have the same rising pattern of average delay in the older planes. But somewhat true does not mean it is completely true. Because although the middle-aged planes (20-40 years) has a low average delay, it doesn't contradict directly against the statement where older planes suffer more delays. There are a few reasons such as due to the pilot's adaptability with planes that are not very new, resulting in a faster turnaround duration and fewer operational mistakes. Another reason would be newer planes tend to operate in busier routes.
+
+The second plot (scatter plots) shows that overall average delay from both arrival and departure delays keeps increasing as the year goes by. Just by observing the first two years (2001 and 2002) and compare it with the last two years (2004 and 2005) shows the overall increase in average delay no matter the aircraft age is. Relating with the first plot, it can be seen that the dots with higher point in both X and Y-axis in each year, indicating a longer flight delay is not entirely made by older planes. Rather it is evenly distributed but with older planes are guaranteed to cause longer delays. 
+
+### Conclusion
+Therefore, it is safe to declare that older planes suffer more delays, but it is not absolute as some newer planes caused delays as well. It is highly possible that older planes suffer more delays due to technical issues as they have older versions of spare parts and it might affect the performance of the plane when attempting to taxi. But some newer planes have issues with delays as well due to external factors such as the environment where newer planes are usually assigned in more hectic areas, increasing the chance of being delayed. Also, newer planes are usually assigned in more frequent flights as they tend to be more fuel-efficient, which could raise the probability of delays due to its more recurring nature.
+
+### 2c. Logistic Regression Model for Diverted US Flights
+The focus here is for the diverted flights in the United States. Therefore, not forgetting to include diverted flights for the analysis is crucial. 
+```{r}
+colnames(flights_data) # Generate columns from flights_data
+```
+
+From the table generated from flights_data, there are some attributes that are going to be used to construct a logistic regression model, which it will reveal the probability of diverted US flights with a designated confidence interval. These attributes are Day_names, DayOfWeek, SDepPartOfDay, CRSElapsedTime, DepDelay, CarrierDelay, Weather Delay, LateAircraftDelay, and Diverted. All stated attributes here except for Diverted will have the role as the predictors while Diverted will act as the main variable for constructing the model and the predictions.
+
+## Change DayOfWeek Integer Values to Their Corresponding Day using the Mutate Function
+```{r}
+flights_data <- flights_data %>%
+  mutate(
+    Day_names = case_when(
+      DayOfWeek == 1 ~ "Monday",
+      DayOfWeek == 2 ~ "Tuesday",
+      DayOfWeek == 3 ~ "Wednesday",
+      DayOfWeek == 4 ~ "Thursday",
+      DayOfWeek == 5 ~ "Friday",
+      DayOfWeek == 6 ~ "Saturday",
+      TRUE ~ "Sunday"
+    ),
+  )
+```
+
+## Change CRSDepTime to the Times Of Day using the Mutate Function As Well
+```{r}
+flights_data <- flights_data %>%
+  mutate(
+    SDepPartOfDay = case_when(
+      CRSDepTime >= 0 & CRSDepTime <= 600 ~ "Dawn",
+      CRSDepTime >= 601 & CRSDepTime <= 1200 ~ "Morning",
+      CRSDepTime >= 1201 & CRSDepTime <= 1800 ~ "Evening",
+      TRUE ~ "Night"
+    ),
+  )
+```
+
+Mutate function acts as a function from dplyr package where it creates new columns that has another function from an existing attribute.
+
+## Filtering out Every Single Flights except for the Flights from the US
+Since the question only asks for Diverted flights from the US, therefore we would only include the US flights for this analysis.
+```{r}
+flights_us <- flights_data %>%
+  filter(UniqueCarrier %in% "US") # Filtered by unique carrier which represents unique code for an airline/plane that belongs to the US.
+```
+
+## Stating the Attributes for Prediction
+
+To simulate predictions, we need another variable that consists of the selected attributes from the filtered Us flights data, which in this case is the 'flights_us'.
+```{r}
+prediction_diverted_us <- flights_us %>%
+  select(Day_names, SDepPartOfDay, CRSElapsedTime, DepDelay, CarrierDelay, WeatherDelay, LateAircraftDelay, Diverted)
+head(prediction_diverted_us)
+```
+
+## Transform the Data Into str and factors
+```{r}
+prediction_diverted_us$Diverted <- ifelse(prediction_diverted_us$Diverted > 0, "Diverted", "Undiverted") # IF statement where Diverted value more than 0 will come out as Diverted and vice versa
+prediction_diverted_us$Diverted <- factor(prediction_diverted_us$Diverted)
+prediction_diverted_us$Day_names <- factor(prediction_diverted_us$Day_names)
+prediction_diverted_us$SDepPartOfDay <- factor(prediction_diverted_us$SDepPartOfDay)
+str(prediction_diverted_us)
+```
+
+Factors are categorical variables which store datas in levels. This is one way to reduce file redundancy and left more storage. The relationship between factors is modelled using the logistic regression. It can show how impactful the attribute is on creating diverted flights through probabilities that are revealed by this model.
+
+## Set Seed for Random Numbers Producibility
+```{r}
+set.seed(143)
+```
+
+## Split Data into Training and Testing Sets of Data using Training Samples
+```{r}
+training.samples <- prediction_diverted_us$Diverted %>%
+  createDataPartition(p = 0.7, list = FALSE) # Spit data into training and testing setsl
+train.data <- prediction_diverted_us[training.samples, ]
+test.data  <- prediction_diverted_us[-training.samples, ]
+```
+
+## Replacing NA Values with Median from Training Data
+```{r}
+cols_to_replace <- c("CRSElapsedTime", "DepDelay", "CarrierDelay", "WeatherDelay", "LateAircraftDelay") # State the columns that has na values to be replaced with median
+test.data <- test.data %>%
+  mutate(across(all_of(cols_to_replace), ~ ifelse(is.na(.), median(train.data[[cur_column()]], na.rm = TRUE), .)))
+```
+
+The key to change NA values to median is to remove unnecessary NA values that could harm the data distribution (either skewed left or right). The reason is because median tends to be less influencing for the distribution structure, leading to a better view of targeted probabilities. However, in some cases, doing this could lead to a biasness as replacing it with median means that the original data is being interfered. For viewing purposes, this analysis will conduct the changes in the NA values.
+
+## Logistic Regression Model
+
+To create model, we use the glm function from stats. It consists of formula, data (the dataset), family (error distribution), and other additional arguments which are necessary. The logistic regression model denoted as 'logreg_model' will have the function of "Diverted" probabilty values in every attributes taken from the dataset: train.data with binomial distribution
+```{r}
+logreg_model <- glm(Diverted ~ ., data = train.data, family = binomial)
+summary(logreg_model)$coef # This summary shows each predictor attribute's estimated effect size, standard errors, z-values, and corresponding p-values
+```
+
+## Prediction Tool
+To see the overall probabilities of diverted US flights from the corresponding attributes:
+```{r}
+probability <- logreg_model %>% predict(test.data, type = "response")
+head(probability)
+```
+
+The result of these probabilities are all very close to 1. This shows that the model experienced overfitting. This could happen as the difference in ratio of Diverted and Undiverted flights are very vast/distinct to each other. Therefore, an important step to remove overfitting probabilities is by up sampling the minor datasets, which in this case is the "Diverted" flights and down sampling the major datasets, which in this case is the "Undiverted" flights. 
+
+## Balance train.data Denoted as btrain.data
+```{r}
+btrain.data <- downSample(x = train.data[, -which(names(train.data) == "Diverted")], y = train.data$Diverted)
+colnames(btrain.data)[ncol(btrain.data)] <- "Diverted" 
+btrain.data <- upSample(x = train.data[, -which(names(train.data) == "Diverted")], y = train.data$Diverted) 
+colnames(btrain.data)[ncol(btrain.data)] <- "Diverted"
+```
+
+## Create Alternative "Diverted" Data while Involving the Down Sampled "Undiverted" Data
+```{r}
+btrain.data <- ROSE(formula = Diverted ~ Day_names + SDepPartOfDay + CRSElapsedTime + DepDelay + CarrierDelay + WeatherDelay + LateAircraftDelay, data = btrain.data, p = 0.7)$data
+```
+
+p = 0.7 means that 70% of the datasets are newly generated using sampling techniques, which is the up and down sampling while maintaining 30% of the real observations. This is to prevent overfitting in the data predictions and may keep the ratio more balanced between "Diverted" and "Undiverted" US flights.
+
+## Create the Model Again with btrain.data Involved
+```{r}
+logreg_model <- glm(Diverted ~ ., data = btrain.data, family = binomial)
+summary(logreg_model)$coef 
+```
+
+## Prediction Tool with btrain.data Involved
+```{r}
+probability <- logreg_model %>% predict(test.data, type = "response") # Here the test.data is already accustomed with btrain.data instead of train.data
+head(probability)
+```
+
+## Confusion Matrix with Class Prediction
+The logistic regression model only computes the probability for each observation before making a classification decision. Therefore, it is set that p = 0.5 for class predictions where p > 0.5 is "Undiverted" and otherwise.
+
+```{r}
+# Set dummy variable
+contrasts(test.data$Diverted)
+
+# Class Prediction
+class.pred <- ifelse(probability > 0.5, "Undiverted", "Diverted")
+class.pred
+
+# Determine whether the model is accurate or not using the Confusion Matrix
+x_table <- table(class.pred, test.data$Diverted)
+c_matrix <- caret::confusionMatrix(x_table, positive = "Diverted")
+c_matrix
+```
+
+Confusion Matrix has its purpose for determining whether the model is accurate for data predictions or not. Here, the confusion matrix has a 95% confidence interval of ((0.9728, 0.9745) and an accuracy of 97.37%. However, do note that this accuracy has its flaws as sampling methods are involved here, which could cause some biasness. Also, sensitivity shows that the model only correctly predicts 33.7% of diverted flights in the US. This shows that this model is not really good for predicting diverted US flights. The Positive Prediction Value being only 2.2% means that the model will 97.8% wrong when it predicts a flight as a "Diverted" flight. All of these are further being supported by the existing low Kappa value, showing weak predicting capabilities. 
+
+In conclusion, it may seem accurate at first. However, due to other attributes shown in the confusion matrix which shows the flaws of this model, it can be concluded that this model is accurate but not suitable for predicting diverted US flights, especially when the variables in the dataset has very distinct ratio (Diverted vs Undiverted).
+
+## Secondary Tester for Accuracy in Modelling
+In this section, ROC Curve Model is used to further test the accuracy of this model
+```{r}
+class <- logreg_model$y  
+score <- qlogis(logreg_model$fitted.values)  
+
+Roc <- rocit(score = score, class = class)
+
+plot(Roc)
+
+class <- factor(class)
+
+roc_auc <- auc(roc(score, class), min = 0, max = 1)
+print(paste0("ROC score: ", roc_auc))
+```
+
+The ROC curve has "Sensitivity" on the Y-axis as the True Positive Rate and "1-Specificity" on the X-axis as the False Positive Rate. The curve tells us how good the model works between classes on different thresholds of classification. The ROC_AUC or ROC score ranges from 0.5 to 1 with 1 being the best and vice versa. The results stated that the ROC score is 0.761 or 76.1%. This is considered as an acceptable model. The Youden Index is a measure for ROC curve that is used for seeking optimal thresholds. The optimal Youden Index point means that it is the best-case scenario of correctly predicting diverted US flights with minimum false predictions. 
+
+Comparing both testers of accuracy and reliability of the logistic regression model, sensitivity from confusion matrix is 0.337 while from ROC curve is between 0.6-0.7. This implies that if probability in confusion matrix is set to be lower than 0.5 such as class.pred <- ifelse(probability > "any numerical value below 0.5", "Undiverted", "Diverted"), the sensitivity result from the confusion matrix will increase as well. However, this could lead to a lower performance in terms of precision and accuracy as false positive predictions, where flights that are predicted to be "Diverted" are wrong.
+
+Therefore, from both testers, it can be concluded that this model which uses the logistic regression model for predicting "Diverted" US flights is not good enough, especially when dealing with large datasets and distinct ratio between variables. The reason for this is due to the inconsistency of results from both testers.
